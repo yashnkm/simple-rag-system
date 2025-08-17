@@ -8,6 +8,7 @@ import gradio as gr
 from dotenv import load_dotenv
 from typing import List, Tuple, Dict
 from datetime import datetime
+import re
 
 # Load environment variables
 load_dotenv()
@@ -25,6 +26,9 @@ class SimpleRAG:
         self.conversation_history = []  # Keep last 7 conversations
         self.documents = {}  # Document metadata: {doc_id: {name, upload_time, chunk_count, chunk_indices}}
         self.text_to_doc = []  # Maps text index to document ID
+        self.bm25_index = None  # BM25 keyword search index
+        self.tokenized_texts = []  # Tokenized texts for BM25
+        self.reranker = None  # Cross-encoder for re-ranking
         
     def extract_text_from_pdf(self, pdf_file) -> str:
         """Extract text from PDF file"""
@@ -44,28 +48,154 @@ class SimpleRAG:
         except Exception as e:
             return f"Error reading TXT: {str(e)}"
     
-    def chunk_text(self, text: str, chunk_size: int = 2500) -> List[str]:
-        """Split text into chunks"""
-        words = text.split()
+    def chunk_text_smart(self, text: str, chunk_size: int = 1000, overlap: int = 200) -> List[str]:
+        """Smart text chunking with sentence awareness and overlap"""
+        # Split into sentences using regex
+        sentence_endings = r'[.!?]+[\s\n]+'
+        sentences = re.split(sentence_endings, text.strip())
+        if not sentences:
+            return []
+        
         chunks = []
-        for i in range(0, len(words), chunk_size):
-            chunk = ' '.join(words[i:i + chunk_size])
-            if chunk.strip():
-                chunks.append(chunk)
+        current_chunk = ""
+        current_length = 0
+        
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+                
+            sentence_length = len(sentence.split())
+            
+            # If single sentence is too long, split it
+            if sentence_length > chunk_size:
+                # Save current chunk if it has content
+                if current_chunk.strip():
+                    chunks.append(current_chunk.strip())
+                
+                # Split long sentence into smaller parts
+                words = sentence.split()
+                for i in range(0, len(words), chunk_size - 50):  # Leave some buffer
+                    chunk_part = ' '.join(words[i:i + chunk_size - 50])
+                    if chunk_part.strip():
+                        chunks.append(chunk_part.strip())
+                
+                current_chunk = ""
+                current_length = 0
+                continue
+            
+            # Check if adding this sentence exceeds chunk size
+            if current_length + sentence_length > chunk_size and current_chunk:
+                chunks.append(current_chunk.strip())
+                
+                # Create overlap by keeping last few sentences
+                if overlap > 0:
+                    overlap_sentences = current_chunk.split('. ')[-2:]  # Last 2 sentences
+                    overlap_text = '. '.join(overlap_sentences)
+                    if len(overlap_text.split()) <= overlap:
+                        current_chunk = overlap_text + '. ' + sentence
+                        current_length = len(current_chunk.split())
+                    else:
+                        current_chunk = sentence
+                        current_length = sentence_length
+                else:
+                    current_chunk = sentence
+                    current_length = sentence_length
+            else:
+                # Add sentence to current chunk
+                if current_chunk:
+                    current_chunk += '. ' + sentence
+                else:
+                    current_chunk = sentence
+                current_length += sentence_length
+        
+        # Add the last chunk
+        if current_chunk.strip():
+            chunks.append(current_chunk.strip())
+        
+        # Filter out very short chunks
+        chunks = [chunk for chunk in chunks if len(chunk.split()) >= 10]
+        
         return chunks
+    
+    def chunk_text(self, text: str, chunk_size: int = 1000) -> List[str]:
+        """Main chunking method - now uses smart chunking"""
+        return self.chunk_text_smart(text, chunk_size=chunk_size, overlap=200)
+    
+    def preprocess_query(self, query: str) -> str:
+        """Enhance query for better retrieval"""
+        # Remove extra whitespace and normalize
+        query = re.sub(r'\s+', ' ', query.strip())
+        
+        # Expand common abbreviations and terms
+        expansions = {
+            r'\bwhat\'s\b': 'what is',
+            r'\bhow\'s\b': 'how is', 
+            r'\bcan\'t\b': 'cannot',
+            r'\bwon\'t\b': 'will not',
+            r'\bdon\'t\b': 'do not',
+            r'\bML\b': 'machine learning',
+            r'\bAI\b': 'artificial intelligence',
+            r'\bNLP\b': 'natural language processing',
+            r'\bAPI\b': 'application programming interface'
+        }
+        
+        for pattern, replacement in expansions.items():
+            query = re.sub(pattern, replacement, query, flags=re.IGNORECASE)
+        
+        return query
     
     def get_embedding(self, text: str) -> List[float]:
         """Generate embedding for text"""
         try:
+            # Preprocess text for better embeddings
+            processed_text = re.sub(r'\s+', ' ', text.strip())
+            
             result = genai.embed_content(
                 model=self.embeddings_model,
-                content=text,
+                content=processed_text,
                 task_type="retrieval_document"
             )
             return result['embedding']
         except Exception as e:
             print(f"Embedding error: {e}")
             return [0.0] * 768  # Return zero vector on error
+    
+    def build_bm25_index(self):
+        """Build BM25 index for keyword search"""
+        if not self.texts:
+            self.bm25_index = None
+            return
+        
+        try:
+            from rank_bm25 import BM25Okapi
+            
+            # Tokenize texts for BM25
+            self.tokenized_texts = [text.lower().split() for text in self.texts]
+            self.bm25_index = BM25Okapi(self.tokenized_texts)
+            print(f"✅ BM25 index built with {len(self.texts)} documents")
+        except ImportError:
+            print("⚠️ rank-bm25 not installed. Using semantic search only.")
+            self.bm25_index = None
+        except Exception as e:
+            print(f"⚠️ BM25 index creation failed: {e}")
+            self.bm25_index = None
+    
+    def load_reranker(self):
+        """Load cross-encoder model for re-ranking"""
+        if self.reranker is not None:
+            return  # Already loaded
+            
+        try:
+            from sentence_transformers import CrossEncoder
+            self.reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+            print("✅ Cross-encoder re-ranker loaded")
+        except ImportError:
+            print("⚠️ sentence-transformers not installed. Skipping re-ranking.")
+            self.reranker = None
+        except Exception as e:
+            print(f"⚠️ Failed to load re-ranker: {e}")
+            self.reranker = None
     
     def process_document(self, file) -> str:
         """Process uploaded document and add to collection"""
@@ -119,41 +249,212 @@ class SimpleRAG:
             self.index = faiss.IndexFlatL2(embeddings_array.shape[1])
             self.index.add(embeddings_array)
             
+            # Rebuild BM25 index
+            self.build_bm25_index()
+            
             # Create status message
             total_docs = len(self.documents)
             total_chunks = len(self.texts)
-            return f"✅ Document '{file.name}' processed successfully!\n📚 Total documents: {total_docs}\n📄 Total chunks: {total_chunks}\n🆕 New chunks: {len(new_texts)}"
+            bm25_status = "✅ BM25" if self.bm25_index else "⚠️ No BM25"
+            return f"✅ Document '{file.name}' processed successfully!\n📚 Total documents: {total_docs}\n📄 Total chunks: {total_chunks}\n🆕 New chunks: {len(new_texts)}\n🔍 Search: {bm25_status} + Semantic"
                 
         except Exception as e:
             return f"Error processing document: {str(e)}"
     
-    def search(self, query: str, k: int = 3) -> List[Dict[str, str]]:
-        """Search for relevant chunks with document source"""
+    def search(self, query: str, k: int = 5) -> List[Dict[str, str]]:
+        """Enhanced search with query preprocessing and adaptive retrieval"""
         if not self.index or not self.texts:
             return []
         
+        # Preprocess query for better matching
+        processed_query = self.preprocess_query(query)
+        
         # Get query embedding
-        query_embedding = self.get_embedding(query)
+        query_embedding = self.get_embedding(processed_query)
         if not query_embedding:
             return []
         
-        # Search in FAISS
-        query_array = np.array([query_embedding], dtype=np.float32)
-        distances, indices = self.index.search(query_array, k)
+        # Adaptive k based on query complexity
+        query_words = len(processed_query.split())
+        if query_words <= 3:
+            k = min(k, 3)  # Simple queries need fewer chunks
+        elif query_words > 10:
+            k = min(k + 2, 8)  # Complex queries might need more chunks
         
-        # Get relevant texts with document info
+        # Search in FAISS with more candidates for potential re-ranking
+        search_k = min(k * 2, len(self.texts))  # Get more candidates
+        query_array = np.array([query_embedding], dtype=np.float32)
+        distances, indices = self.index.search(query_array, search_k)
+        
+        # Get relevant texts with document info and scores
         relevant_results = []
-        for idx in indices[0]:
+        for i, idx in enumerate(indices[0]):
             if idx < len(self.texts):
                 doc_id = self.text_to_doc[idx]
                 doc_name = self.documents[doc_id]["name"]
+                
+                # Simple relevance scoring based on distance
+                similarity_score = 1.0 / (1.0 + distances[0][i])
+                
                 relevant_results.append({
                     "text": self.texts[idx],
                     "document": doc_name,
-                    "doc_id": doc_id
+                    "doc_id": doc_id,
+                    "score": similarity_score,
+                    "distance": float(distances[0][i])
                 })
         
-        return relevant_results
+        # Basic re-ranking: prefer results with query terms
+        def calculate_keyword_score(text: str, query: str) -> float:
+            text_lower = text.lower()
+            query_words = query.lower().split()
+            
+            score = 0.0
+            for word in query_words:
+                if len(word) > 2:  # Skip very short words
+                    if word in text_lower:
+                        score += 1.0
+                        # Bonus for exact phrase matches
+                        if word in text_lower.split():
+                            score += 0.5
+            
+            return score / len(query_words) if query_words else 0.0
+        
+        # Add keyword scores and re-rank
+        for result in relevant_results:
+            keyword_score = calculate_keyword_score(result["text"], processed_query)
+            # Combine semantic and keyword scores
+            result["final_score"] = (result["score"] * 0.7) + (keyword_score * 0.3)
+        
+        # Sort by final score and return top k
+        relevant_results.sort(key=lambda x: x["final_score"], reverse=True)
+        return relevant_results[:k]
+    
+    def search_hybrid(self, query: str, k: int = 5) -> List[Dict[str, str]]:
+        """Hybrid search combining BM25 + semantic search"""
+        if not self.index or not self.texts:
+            return []
+        
+        # Preprocess query
+        processed_query = self.preprocess_query(query)
+        query_tokens = processed_query.lower().split()
+        
+        # Get semantic search results
+        semantic_results = self.search(processed_query, k=k*2)  # Get more candidates
+        
+        # Get BM25 keyword search results
+        bm25_results = []
+        if self.bm25_index:
+            try:
+                bm25_scores = self.bm25_index.get_scores(query_tokens)
+                
+                # Get top BM25 results
+                bm25_top_indices = sorted(range(len(bm25_scores)), 
+                                         key=lambda i: bm25_scores[i], reverse=True)[:k*2]
+                
+                for idx in bm25_top_indices:
+                    if idx < len(self.texts) and bm25_scores[idx] > 0:
+                        doc_id = self.text_to_doc[idx]
+                        doc_name = self.documents[doc_id]["name"]
+                        
+                        bm25_results.append({
+                            "text": self.texts[idx],
+                            "document": doc_name,
+                            "doc_id": doc_id,
+                            "bm25_score": float(bm25_scores[idx]),
+                            "index": idx
+                        })
+            except Exception as e:
+                print(f"BM25 search failed: {e}")
+        
+        # Combine and deduplicate results
+        combined_results = {}
+        
+        # Add semantic results
+        for result in semantic_results:
+            text_hash = hash(result["text"])
+            combined_results[text_hash] = {
+                **result,
+                "semantic_score": result.get("final_score", 0.0),
+                "bm25_score": 0.0
+            }
+        
+        # Add/update with BM25 results
+        for result in bm25_results:
+            text_hash = hash(result["text"])
+            if text_hash in combined_results:
+                combined_results[text_hash]["bm25_score"] = result["bm25_score"]
+            else:
+                combined_results[text_hash] = {
+                    **result,
+                    "semantic_score": 0.0,
+                    "bm25_score": result["bm25_score"]
+                }
+        
+        # Calculate final hybrid scores
+        final_results = []
+        max_bm25 = max([r["bm25_score"] for r in combined_results.values()]) if combined_results else 1.0
+        
+        for result in combined_results.values():
+            # Normalize scores
+            semantic_norm = result["semantic_score"]
+            bm25_norm = result["bm25_score"] / max(1.0, max_bm25)
+            
+            # Weighted combination: 60% semantic, 40% keyword
+            final_score = (semantic_norm * 0.6) + (bm25_norm * 0.4)
+            
+            result["final_hybrid_score"] = final_score
+            final_results.append(result)
+        
+        # Sort by hybrid score and return top k
+        final_results.sort(key=lambda x: x["final_hybrid_score"], reverse=True)
+        return final_results[:k]
+    
+    def rerank_results(self, query: str, results: List[Dict], top_k: int = 5) -> List[Dict]:
+        """Re-rank search results using cross-encoder"""
+        if not self.reranker or not results:
+            return results[:top_k]
+        
+        try:
+            # Prepare query-document pairs for re-ranking
+            query_doc_pairs = [(query, result["text"]) for result in results]
+            
+            # Get relevance scores from cross-encoder
+            rerank_scores = self.reranker.predict(query_doc_pairs)
+            
+            # Add re-ranking scores to results
+            for i, result in enumerate(results):
+                result["rerank_score"] = float(rerank_scores[i])
+                # Combine with existing scores
+                existing_score = result.get("final_hybrid_score", result.get("final_score", 0.0))
+                result["final_reranked_score"] = (existing_score * 0.3) + (result["rerank_score"] * 0.7)
+            
+            # Sort by re-ranked scores
+            results.sort(key=lambda x: x["final_reranked_score"], reverse=True)
+            return results[:top_k]
+            
+        except Exception as e:
+            print(f"Re-ranking failed: {e}")
+            return results[:top_k]
+    
+    def search_with_reranking(self, query: str, k: int = 5) -> List[Dict[str, str]]:
+        """Search with re-ranking for maximum accuracy"""
+        # Get more candidates for re-ranking
+        candidate_k = min(k * 3, 15)  # Get 3x more candidates
+        
+        # Use hybrid search if available
+        if self.bm25_index:
+            candidates = self.search_hybrid(query, k=candidate_k)
+        else:
+            candidates = self.search(query, k=candidate_k)
+        
+        # Re-rank candidates if re-ranker is available
+        if self.reranker:
+            final_results = self.rerank_results(query, candidates, top_k=k)
+        else:
+            final_results = candidates[:k]
+        
+        return final_results
     
     def get_document_list(self) -> str:
         """Get formatted list of uploaded documents"""
@@ -257,20 +558,37 @@ class SimpleRAG:
         return "\n".join(context_parts)
 
     def generate_answer(self, query: str) -> str:
-        """Generate answer using RAG with conversation memory"""
+        """Generate answer using advanced RAG with hybrid search and re-ranking"""
         if not self.index:
             return "Please upload a document first."
         
-        # Get relevant context
-        relevant_results = self.search(query)
+        # Load re-ranker if not loaded and available
+        if not self.reranker:
+            self.load_reranker()
+        
+        # Use the best available search method
+        if self.reranker:
+            relevant_results = self.search_with_reranking(query)
+            search_method = "🧠 Re-ranked"
+        elif self.bm25_index:
+            relevant_results = self.search_hybrid(query)
+            search_method = "🔍 Hybrid"
+        else:
+            relevant_results = self.search(query)
+            search_method = "🔎 Semantic"
+        
         if not relevant_results:
             return "No relevant information found in the documents."
         
-        # Build document context with sources
+        # Build document context with sources and relevance info
         document_parts = []
         sources_used = set()
-        for result in relevant_results:
-            document_parts.append(f"[From {result['document']}]: {result['text']}")
+        for i, result in enumerate(relevant_results, 1):
+            # Add relevance indicator
+            score = result.get("final_reranked_score", result.get("final_hybrid_score", result.get("final_score", 0.0)))
+            relevance = "🎯" if score > 0.7 else "📄" if score > 0.4 else "📃"
+            
+            document_parts.append(f"[{relevance} From {result['document']}]: {result['text']}")
             sources_used.add(result['document'])
         
         document_context = "\n\n".join(document_parts)
@@ -298,6 +616,7 @@ Instructions:
 - If the context doesn't have enough information, say so politely
 - Keep the answer clear and concise
 - When relevant, mention which document(s) you're referencing
+- The 🎯 emoji indicates high-relevance content, prioritize that information
 
 Answer:"""
         
@@ -305,9 +624,9 @@ Answer:"""
             response = self.llm_model.generate_content(prompt)
             answer = response.text
             
-            # Add source information to answer
+            # Add source and method information to answer
             if len(sources_used) > 0:
-                answer += f"\n\n📚 Sources: {sources_list}"
+                answer += f"\n\n📚 Sources: {sources_list}\n🔍 Search: {search_method}"
             
             # Add to conversation history
             self.add_to_conversation_history(query, answer)
